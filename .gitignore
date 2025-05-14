@@ -134,3 +134,14 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+.prettierrc
+.venv/
+.vscode/
+__pycache__/
+audio_samples/
+!/
+cuda-keyring_1.1-1_all.deb
+eslint.config.js
+testing.js
+testing.py
