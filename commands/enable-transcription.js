@@ -5,21 +5,61 @@ const {
     VoiceConnectionStatus,
 } = require("@discordjs/voice");
 const { opus } = require("prism-media");
-const { Transform } = require("stream");
 const WebSocket = require("ws");
-const waveResampler = require("wave-resampler");
+const Resample48to16 = require("../resample48to16");
+const fs = require("fs");
+const path = require("path");
 
 // WebSocket URL
 const wsUrl = "ws://localhost:8000/transcribe";
 
+// Store websocket connections for each user
 let webSocketConnections = {};
+
+class WebSocketSenderStream extends require("stream").Writable {
+    constructor(ws) {
+        super();
+        this._ws = ws;
+    }
+
+    _write(chunk, encoding, callback) {
+        console.log(`16khz chunk length: ${chunk.length}`);
+        // This method is called for each chunk of data from the piped stream
+        if (this._ws && this._ws.readyState === this._ws.OPEN) {
+            this._ws.send(chunk, { binary: true }, (err) => {
+                if (err) {
+                    console.error(
+                        "Error sending audio chunk over WebSocket",
+                        err
+                    );
+                    // Optionally call callback(err) to propagate the error back up the pipe
+                    // For this use case, just logging might be sufficient
+                }
+                // Call the callback when you are ready to receive the next chunk
+                callback();
+            });
+        } else {
+            console.warn(
+                "WebSocket connection not open. Dropping audio chunk."
+            );
+            // If the WebSocket isn't open, we still need to call the callback
+            // to allow the upstream stream to continue flowing data (which will be dropped)
+            callback();
+        }
+    }
+
+    // You might also want to handle the 'finish' event on the Writable stream
+    // This signifies that the piped Readable stream has ended and all data has been processed
+    _final(callback) {
+        // Optional: Do something when the source stream ends and all buffered data is written
+        // console.log("WebSocketSenderStream finished.");
+        callback(); // Important to call callback when finished
+    }
+}
 
 module.exports = async function execute(client, interaction) {
     const voiceChannel = interaction.member.voice.channel;
     let connection;
-
-    let pcm_48 = 0;
-    let pcm_16 = 0;
 
     if (!voiceChannel) {
         return interaction.channel.send(
@@ -51,116 +91,143 @@ module.exports = async function execute(client, interaction) {
 
     // Subscribe to receiver when users speak
     receiver.speaking.on("start", (userId) => {
-        // Establish websocket connection for user once they start speaking only if they don't have one already
-        /* if (!webSocketConnections[userId]) {
-            webSocketConnections[userId] = new WebSocket(wsUrl);
-        }
-
-        const ws = webSocketConnections[userId]; */
-
-        // Connection opened
-        /* ws.onopen = () => {
-            console.log(`The ${username} has connected to the FastApi Server`);
-        }; */
-
-        /* ws.onmessage = (event) => {
-            console.log(`Message from FastApi server: ${event.data}`);
-        }; */
-
         const user = voiceChannel.members.get(userId);
         if (!user) return;
 
         const username = user.user.globalName;
-        console.log(`${username} is speaking`);
 
-        const decoder = new opus.Decoder({
-            rate: 48000,
-            channels: 1,
-            frameSize: 960,
-        });
+        const setupAudioStreams = () => {
+            console.log(`🔴${username} is speaking`);
 
-        // Create a Transform that processes 20 ms @48 kHz → 20 ms @16 kHz
-        class Resample48to16 extends Transform {
-            constructor() {
-                super();
-                this.inRate = 48000;
-                this.outRate = 16000;
-                this.method = "sinc"; // highest quality
+            const startTime = Date.now();
+
+            // Subscribe speaker to audio stream to register their audio
+            const audioStream = connection.receiver.subscribe(userId, {
+                end: {
+                    behavior: EndBehaviorType.AfterSilence,
+                    duration: 1000,
+                },
+            });
+
+            audioStream.on("error", (error) =>
+                console.error(`AudioStream Error for ${username}:`, error)
+            );
+
+            // Decoder
+            const decoder = new opus.Decoder({
+                rate: 48000,
+                channels: 1,
+                frameSize: 960,
+            });
+            decoder.on("error", (error) =>
+                console.error(`Decoder Error for ${username}:`, error)
+            );
+
+            // Resampler
+            const resampler = new Resample48to16();
+            resampler.on("error", (error) =>
+                console.error(`Resampler Error for ${username}:`, error)
+            );
+
+            const opusToPcm = audioStream.pipe(decoder);
+
+            opusToPcm.on("data", (chunk) => {
+                console.log(`🔵48khz PCM chunk size: ${chunk.length}`);
+            });
+
+            const pcm48to16 = opusToPcm.pipe(resampler);
+
+            pcm48to16.on("data", (chunk) => {
+                console.log(`🟢16khz PCM chunk size: ${chunk.length}`);
+            });
+
+            // APPENDING RESAMPLED AUDIO TO .raw FILE
+            // directory where audio files are going to be stored
+            const audioOutputDir = "./audioFiles";
+            if (!fs.existsSync(audioOutputDir)) {
+                fs.mkdirSync(audioOutputDir);
             }
 
-            _transform(chunk, encoding, cb) {
-                // chunk: Buffer of PCM16LE @48 kHz (960 samples = 1920 bytes)
-                // Convert to Int16 array
-                const inSamples = new Int16Array(
-                    chunk.buffer,
-                    chunk.byteOffset,
-                    chunk.length / 2
+            // Generate unique audio file
+            const outputFile = `${userId}.raw`;
+            const outputPath = path.join(audioOutputDir, outputFile);
+
+            // Write stream to populate .raw audio file
+            const writeStream = fs.createWriteStream(outputPath, {
+                flags: "a",
+            });
+
+            pcm48to16.pipe(writeStream);
+
+            writeStream.on("finish", () => {
+                const endTime = Date.now();
+                console.log(
+                    `🔴 Username: ${username} has finished speaking. Spoke for ${
+                        endTime - startTime
+                    } seconds.`
                 );
-                // Resample to 16 kHz (returns Int16Array)
-                const outSamples = waveResampler.resample(
-                    inSamples,
-                    this.inRate,
-                    this.outRate,
-                    { method: this.method }
-                );
-                // Push back as Buffer (320 samples = 640 bytes)
-                this.push(Buffer.from(outSamples.buffer));
-                cb();
-            }
+                // Cleanup streams
+                audioStream.destroy();
+                decoder.destroy();
+                resampler.destroy();
+                writeStream.destroy();
+            });
+
+            pcm48to16.on("end", () => {
+                writeStream.end();
+            });
+
+            /* pipe it to writable stream wsSender to send it
+            to the fastapi server for further transcription */
+
+            /* const wsSender = new WebSocketSenderStream(ws);
+            wsSender.on("error", (error) =>
+                console.error(`WebSocketSender Error for ${username}:`, error)
+            );
+
+            audioStream.pipe(decoder).pipe(resampler).pipe(wsSender);
+
+            wsSender.on("finish", () => {
+                if (resampler) {
+                    resampler.removeAllListeners();
+                }
+
+                if (decoder) {
+                    decoder.removeAllListeners();
+                }
+
+                if (audioStream) {
+                    audioStream.removeAllListeners();
+                }
+
+                console.log(`🛑 ${username} stopped speaking`);
+            }); */
+        };
+
+        // Establish websocket connection for user once they start speaking only if they don't have one already
+        if (!webSocketConnections[userId]) {
+            webSocketConnections[userId] = new WebSocket(wsUrl);
         }
 
-        // Subscribe speaker to audio stream to register their audio
-        const audioStream = connection.receiver.subscribe(userId, {
-            end: {
-                behavior: EndBehaviorType.AfterSilence,
-                duration: 1000,
-            },
-        });
+        const ws = webSocketConnections[userId];
 
-        // Turning compressed opus audio into uncompressed raw 48khz PCM chunks
-        const pcmStream = audioStream.pipe(decoder);
-
-        pcmStream.on("data", (chunk) => {
-            pcm_48 += 1;
-            console.log(`🔵 [48kHz PCM]: ${chunk.length} bytes`);
-        });
-
-        const resampler = new Resample48to16();
-
-        const pcm48Topcm16 = pcmStream.pipe(resampler);
-
-        pcm48Topcm16.on("data", (chunk) => {
-            pcm_16 += 1;
-            console.log(`🟢 [16kHz PCM]: ${chunk.length} bytes`);
-        });
-
-        /* resampler.stdout.on("data", (chunk) => {
-            pcm_16 += 1;
-            console.log(`🟢 [16kHz PCM]: ${chunk.length} bytes`);
-
-            if (ws && ws.readyState === ws.OPEN) {
-                // Check if the WebSocket connection is open before sending
-                ws.send(chunk, { binary: true }, (err) => {
-                    if (err) {
-                        console.error(
-                            "Error sending audio chunk over WebSocket"
-                        );
-                    }
-                });
-            } else {
-                console.warn(
-                    "WebSocket connection not open. Dropping audio chunk."
+        if (ws.readyState === WebSocket.OPEN) {
+            setupAudioStreams();
+        } else if (ws.readyState === WebSocket.CONNECTING) {
+            ws.once("open", () => {
+                console.log(
+                    `The user ${username} has connected to the FastApi Server`
                 );
-            }
-        }); */
+                setupAudioStreams();
+            });
+        } else {
+            console.warn(
+                `WebSocket for user ${userId} is in state ${ws.readyState}. Cannot send audio for this turn.`
+            );
+        }
 
-        audioStream.on("end", () => {
-            console.log(`PCM 16khz: ${pcm_16}`);
-            console.log(`PCM 48khz: ${pcm_48}`);
-            console.log(`PCM 16khz: ${pcm_16 * 640} bytes`);
-            console.log(`PCM 48khz: ${pcm_48 * 1920} bytes`);
-
-            console.log(`🛑 ${username} stopped speaking`);
-        });
+        ws.onmessage = (event) => {
+            console.log(`Message from FastApi server: ${event.data}`);
+        };
     });
 };
